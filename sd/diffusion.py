@@ -23,7 +23,10 @@ class TimeEmbedding(nn.Module):
 
         return x
 
+# NOTE: Purpose is to combine the time step embedding, the text conditions and
+# the noisified image
 class UNET_ResidualBlock(nn.Module):
+    # NOTE: n_time: Dimension of the time embedding
     def __init__(self, in_channels, out_channels, n_time=1280):
         super().__init__()
         self.groupnorm_feature = nn.GroupNorm(32, in_channels)
@@ -36,6 +39,9 @@ class UNET_ResidualBlock(nn.Module):
         if in_channels == out_channels:
             self.residual_layer = nn.Identity()
         else:
+            # NOTE: Convolution to convert size of input to size of output
+            # NOTE: Aggregates the value at each (height,width) across a few channels to go from number of input channels
+            # in_channels to number of output channels out_channels which allow for mixing of values across channels
             self.residual_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0)
     
     def forward(self, feature, time):
@@ -59,8 +65,10 @@ class UNET_ResidualBlock(nn.Module):
         # (1, 1280) -> (1, Out_Channels)
         time = self.linear_time(time)
         
-        # Add width and height dimension to time. 
-        # (Batch_Size, Out_Channels, Height, Width) + (1, Out_Channels, 1, 1) -> (Batch_Size, Out_Channels, Height, Width)
+        # NOTE: Add width and height dimension to time. The batch dimension is not added by the .unsqueeze() operations but 
+        # broadcasted automatically by PyTorch when additions are performed.
+        # When broadcasted, the original value is simply copied at every location.
+        # (Batch_Size, Out_Channels, Height, Width) + (1, Out_Channels, 1, 1) - (Broadcasting from (1,1) to (Height,Width) in height and width dimensions)> (Batch_Size, Out_Channels, Height, Width)
         merged = feature + time.unsqueeze(-1).unsqueeze(-1)
         
         # (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
@@ -75,6 +83,7 @@ class UNET_ResidualBlock(nn.Module):
         # (Batch_Size, Out_Channels, Height, Width) + (Batch_Size, Out_Channels, Height, Width) -> (Batch_Size, Out_Channels, Height, Width)
         return merged + self.residual_layer(residue)
 
+# NOTE: Purpose is to use cross attention to allow model to know which to focus on
 class UNET_AttentionBlock(nn.Module):
     def __init__(self, n_head: int, n_embd: int, d_context=768):
         super().__init__()
@@ -175,6 +184,7 @@ class UNET_AttentionBlock(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        # NOTE: Does not change number of features and size of the image
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
     
     def forward(self, x):
@@ -183,11 +193,15 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 class SwitchSequential(nn.Sequential):
+    # NOTE: x is the latent here
+    # NOTE: context is the text prompt
     def forward(self, x, context, time):
         for layer in self:
             if isinstance(layer, UNET_AttentionBlock):
+                # NOTE: Compute cross attention between latent and prompt
                 x = layer(x, context)
             elif isinstance(layer, UNET_ResidualBlock):
+                # NOTE: Match latent with the timestamp
                 x = layer(x, time)
             else:
                 x = layer(x)
@@ -197,6 +211,9 @@ class UNET(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoders = nn.ModuleList([
+            # NOTE: Given a list of layers, apply them one by one
+            # NOTE: Think of it as a Sequential but can recognise parameters of each layer in the list and apply them
+            # accordingly
             # (Batch_Size, 4, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
             SwitchSequential(nn.Conv2d(4, 320, kernel_size=3, padding=1)),
             
@@ -206,6 +223,7 @@ class UNET(nn.Module):
             # (Batch_Size, 320, Height / 8, Width / 8) -> # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 8, Width / 8)
             SwitchSequential(UNET_ResidualBlock(320, 320), UNET_AttentionBlock(8, 40)),
             
+            # NOTE: First downsampling, (Height/8, Width/8) -> (Height/16, Width,16)
             # (Batch_Size, 320, Height / 8, Width / 8) -> (Batch_Size, 320, Height / 16, Width / 16)
             SwitchSequential(nn.Conv2d(320, 320, kernel_size=3, stride=2, padding=1)),
             
@@ -215,6 +233,7 @@ class UNET(nn.Module):
             # (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 16, Width / 16)
             SwitchSequential(UNET_ResidualBlock(640, 640), UNET_AttentionBlock(8, 80)),
             
+            # NOTE: Second downsampling (Height/16, Width/16) -> (Height/32, Width,32)
             # (Batch_Size, 640, Height / 16, Width / 16) -> (Batch_Size, 640, Height / 32, Width / 32)
             SwitchSequential(nn.Conv2d(640, 640, kernel_size=3, stride=2, padding=1)),
             
@@ -224,6 +243,7 @@ class UNET(nn.Module):
             # (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 32, Width / 32)
             SwitchSequential(UNET_ResidualBlock(1280, 1280), UNET_AttentionBlock(8, 160)),
             
+            # NOTE: Third downsampling (Height/32, Width/32) -> (Height/64, Width,64)
             # (Batch_Size, 1280, Height / 32, Width / 32) -> (Batch_Size, 1280, Height / 64, Width / 64)
             SwitchSequential(nn.Conv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
             
@@ -246,6 +266,7 @@ class UNET(nn.Module):
         )
         
         self.decoders = nn.ModuleList([
+            # NOTE: 2560 since concatenation of encoder output via skip connection and the previous downsampled output
             # (Batch_Size, 2560, Height / 64, Width / 64) -> (Batch_Size, 1280, Height / 64, Width / 64)
             SwitchSequential(UNET_ResidualBlock(2560, 1280)),
             
@@ -297,11 +318,10 @@ class UNET(nn.Module):
 
         for layers in self.decoders:
             # Since we always concat with the skip connection of the encoder, the number of features increases before being sent to the decoder's layer
-            x = torch.cat((x, skip_connections.pop()), dim=1) 
+            x = torch.cat((x, skip_connections.pop()), dim=1)
             x = layers(x, context, time)
         
         return x
-
 
 class UNET_OutputLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -336,6 +356,7 @@ class Diffusion(nn.Module):
         # context: (Batch_Size, Seq_Len, Dim)
         # time: (1, 320)
 
+        # NOTE: Tells model at which step we are in in the denosification
         # (1, 320) -> (1, 1280)
         time = self.time_embedding(time)
         

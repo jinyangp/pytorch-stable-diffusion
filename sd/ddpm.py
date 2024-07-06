@@ -6,23 +6,34 @@ class DDPMSampler:
     def __init__(self, generator: torch.Generator, num_training_steps=1000, beta_start: float = 0.00085, beta_end: float = 0.0120):
         # Params "beta_start" and "beta_end" taken from: https://github.com/CompVis/stable-diffusion/blob/21f890f9da3cfbeaba8e2ac3c425ee9e998d5229/configs/stable-diffusion/v1-inference.yaml#L5C8-L5C8
         # For the naming conventions, refer to the DDPM paper (https://arxiv.org/pdf/2006.11239.pdf)
+        
+        # NOTE: Beta is a series of numbers that indicates variance of noise added at each step
         self.betas = torch.linspace(beta_start ** 0.5, beta_end ** 0.5, num_training_steps, dtype=torch.float32) ** 2
+        # NOTE: alpha_t = 1. - beta_t
         self.alphas = 1.0 - self.betas
+        # NOTE: AKA alpha_bar Calculate the products of alphas at each timestep t
+        # [alpgha_0, alpha_0 * alpha_1, ... , alpha_0 * alpha_1 * ... * alpha_T] where 
+        # T is the total number of training steps
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.one = torch.tensor(1.0)
+
 
         self.generator = generator
 
         self.num_train_timesteps = num_training_steps
+        # NOTE: Want to go from noisy to original image so we reverse the timestamp array
         self.timesteps = torch.from_numpy(np.arange(0, num_training_steps)[::-1].copy())
 
     def set_inference_timesteps(self, num_inference_steps=50):
+        # NOTE: 999, 998, 997, ... , 0 --> 1000 steps
         self.num_inference_steps = num_inference_steps
+        # NOTE: 999 - 20, 999 - (20*2), ... , 999 - (20*50) --> 50 steps
         step_ratio = self.num_train_timesteps // self.num_inference_steps
         timesteps = (np.arange(0, num_inference_steps) * step_ratio).round()[::-1].copy().astype(np.int64)
         self.timesteps = torch.from_numpy(timesteps)
 
     def _get_previous_timestep(self, timestep: int) -> int:
+        # NOTE: subtracting the step_ratio: self.num_train_timesteps // self.num_inference_steps
         prev_t = timestep - self.num_train_timesteps // self.num_inference_steps
         return prev_t
     
@@ -49,12 +60,22 @@ class DDPMSampler:
             More noise (strength ~ 1) means that the output will be further from the input image.
             Less noise (strength ~ 0) means that the output will be closer to the input image.
         """
+
+        # NOTE: Decide at which timestep to start at which consequently affects amount of noise in the image
+        # we are starting with
+        # self.timesteps = [999, 979, 959, ..., 0] assuming 1000 num_training_steps
+        # and 50 num_sample_steps
+        # hence, starting at index 0 is the image with the most noise being added
         # start_step is the number of noise levels to skip
         start_step = self.num_inference_steps - int(self.num_inference_steps * strength)
         self.timesteps = self.timesteps[start_step:]
         self.start_step = start_step
 
+    # NOTE: This function removes the noise
     def step(self, timestep: int, latents: torch.Tensor, model_output: torch.Tensor):
+
+        # NOTE: Taking reference to the formula following to sample x_(t-1) ~ p_theta(x_(t-1) | x_t) is to
+        #  compute... between formula (11) and formula (12) 
         t = timestep
         prev_t = self._get_previous_timestep(t)
 
@@ -81,7 +102,7 @@ class DDPMSampler:
 
         # 6. Add noise
         variance = 0
-        if t > 0:
+        if t > 0: 
             device = model_output.device
             noise = torch.randn(model_output.shape, generator=self.generator, device=device, dtype=model_output.dtype)
             # Compute the variance as per formula (7) from https://arxiv.org/pdf/2006.11239.pdf
@@ -93,6 +114,7 @@ class DDPMSampler:
 
         return pred_prev_sample
     
+    # NOTE: This function adds the noise
     def add_noise(
         self,
         original_samples: torch.FloatTensor,

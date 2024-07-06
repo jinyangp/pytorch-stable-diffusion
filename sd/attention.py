@@ -4,11 +4,13 @@ from torch.nn import functional as F
 import math
 
 class SelfAttention(nn.Module):
+    # NOTE: d_embed here refers to the number of channels each pixel is represented by
+    # NOTE: bias matrices are not present in the original transformer model
     def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True):
         super().__init__()
         # This combines the Wq, Wk and Wv matrices into one matrix
         self.in_proj = nn.Linear(d_embed, 3 * d_embed, bias=in_proj_bias)
-        # This one represents the Wo matrix
+        # This one represents the Wo matrix --> of shape (d_model, d_model)
         self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
@@ -37,6 +39,22 @@ class SelfAttention(nn.Module):
         weight = q @ k.transpose(-1, -2)
         
         if causal_mask:
+            '''NOTE:
+            Imagine the matrix to be:
+
+                    t1 t2 t3 ... tn
+                t1
+                t2
+                t3
+                .
+                .
+                .
+
+                tn
+            So, by filling up the upper rectangle of the matrix, we prevent t1 from having interactions
+            with t2,t3 up till tn. (and so on)
+            '''
+
             # Mask where the upper triangle (above the principal diagonal) is 1
             mask = torch.ones_like(weight, dtype=torch.bool).triu(1) 
             # Fill the upper triangle with -inf
@@ -67,16 +85,17 @@ class SelfAttention(nn.Module):
 class CrossAttention(nn.Module):
     def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True):
         super().__init__()
-        self.q_proj   = nn.Linear(d_embed, d_embed, bias=in_proj_bias)
-        self.k_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
-        self.v_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
+        self.q_proj = nn.Linear(d_embed, d_embed, bias=in_proj_bias)
+        self.k_proj = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
+        self.v_proj = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
         self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
-    
+
+
     def forward(self, x, y):
-        # x (latent): # (Batch_Size, Seq_Len_Q, Dim_Q)
-        # y (context): # (Batch_Size, Seq_Len_KV, Dim_KV) = (Batch_Size, 77, 768)
+        # x (latent) - (image with noise in sd): # (Batch_Size, Seq_Len_Q, Dim_Q)
+        # y (context) - (text prompt in sd): # (Batch_Size, Seq_Len_KV, Dim_KV) = (Batch_Size, 77, 768)
 
         input_shape = x.shape
         batch_size, sequence_length, d_embed = input_shape
@@ -104,6 +123,8 @@ class CrossAttention(nn.Module):
         weight /= math.sqrt(self.d_head)
         
         # (Batch_Size, H, Seq_Len_Q, Seq_Len_KV)
+        # NOTE: No causal mask here since every pixel can watch every token in the prompt sentence and any token in the prompt sentence
+        # can watch every pixel
         weight = F.softmax(weight, dim=-1)
         
         # (Batch_Size, H, Seq_Len_Q, Seq_Len_KV) @ (Batch_Size, H, Seq_Len_KV, Dim_Q / H) -> (Batch_Size, H, Seq_Len_Q, Dim_Q / H)
